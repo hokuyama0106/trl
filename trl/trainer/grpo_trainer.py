@@ -43,6 +43,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
+    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoProcessor,
     AutoTokenizer,
@@ -272,7 +273,8 @@ class GRPOTrainer(BaseTrainer):
             # Distributed training requires device_map=None ("auto" fails)
             if args.distributed_state.distributed_type in ["MULTI_GPU", "DEEPSPEED"]:
                 model_init_kwargs["device_map"] = None
-            model = create_model_from_path(model, **model_init_kwargs)
+                model_init_kwargs["trust_remote_code"] = True
+            model = create_model_from_path(model, architecture=AutoModelForCausalLM, **model_init_kwargs)
         else:
             if args.model_init_kwargs is not None:
                 logger.warning(
@@ -291,7 +293,7 @@ class GRPOTrainer(BaseTrainer):
         # Processing class
         if processing_class is None:
             processing_class = AutoProcessor.from_pretrained(
-                get_config_model_id(model.config), truncation_side="left", padding_side="left"
+                get_config_model_id(model.config), truncation_side="left", padding_side="left", trust_remote_code=True,
             )
 
         # Handle pad token for processors or tokenizers
@@ -681,6 +683,7 @@ class GRPOTrainer(BaseTrainer):
                 * args.steps_per_generation,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 model_impl=args.vllm_model_impl,
+                trust_remote_code=True,
                 # Generation configuration
                 repetition_penalty=self.repetition_penalty,
                 temperature=self.temperature,

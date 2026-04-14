@@ -30,8 +30,15 @@ requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.4.0",
     "datasets>=3.0.0",
+    "deepspeed>=0.18.9",
+    "flash-attn>=2.8.3",
+    "liger-kernel>=0.7.0",
+    "omegaconf>=2.3.0",
     "packaging>20.0",
-    "transformers>=4.56.2",
+    "tensorboard>=2.20.0",
+    "transformers==4.57.1",
+    "vllm==0.13.0",
+    "vllm-plamo3",
 ]
 dynamic = ["version"]
 
@@ -82,7 +89,7 @@ test = [
     "pytest"
 ]
 vllm = [
-    "vllm>=0.10.2,<0.13.0",
+    "vllm>=0.10.2,<=0.13.0",
     "fastapi",
     "pydantic",
     "requests",
@@ -192,3 +199,6 @@ filterwarnings = [
     "ignore:The argument 'device' of Tensor.pin_memory:DeprecationWarning",
     "ignore:The argument 'device' of Tensor.is_pinned:DeprecationWarning",
 ]
+
+[tool.uv.sources]
+vllm-plamo3 = { git = "file:///mnt/shared/hokuyama/vllm-plamo3-plugin", rev = "bc2490a7c698303b59a346d395a5064490adcdee" }
