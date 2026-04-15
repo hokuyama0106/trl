@@ -1121,28 +1121,50 @@ def main(script_args: ScriptArguments):
 
                 # Manual XML-json tool call parsing
                 if request.tools and text:
-                    pattern = r"<tool_call>(.*?)</tool_call>"
-                    matches = re.findall(pattern, text, re.DOTALL)
-                    if matches:
+                    tool_req_pattern = r"<\|plamo:begin_tool_request:plamo\|>(.*?)<\|plamo:end_tool_request:plamo\|>"
+                    tool_req_blocks = re.findall(tool_req_pattern, text, re.DOTALL)
+
+                    if tool_req_blocks:
                         tool_calls = []
-                        for match in matches:
-                            try:
-                                data = json.loads(match.strip())
-                                tool_calls.append(
-                                    {
-                                        "id": f"call_{uuid.uuid4().hex[:24]}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": data.get("name", ""),
-                                            "arguments": json.dumps(data.get("arguments", {})),
-                                        },
-                                    }
-                                )
-                            except json.JSONDecodeError:
+
+                        for block in tool_req_blocks:
+                            name_pattern = r"<\|plamo:begin_tool_name:plamo\|>(.*?)<\|plamo:end_tool_name:plamo\|>"
+                            m_name = re.search(name_pattern, block, re.DOTALL)
+                            if not m_name:
                                 continue
+                            tool_name = m_name.group(1).strip()
+
+                            args_pattern = r"<\|plamo:msg\|>\s*(\{.*?\})\s*<"
+                            m_args = re.search(args_pattern, block, re.DOTALL)
+
+                            args_obj = {}
+                            if m_args:
+                                args_raw = m_args.group(1).strip()
+                                try:
+                                    args_obj = json.loads(args_raw)
+                                except json.JSONDecodeError:
+                                    continue
+
+                            tool_calls.append(
+                                {
+                                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": json.dumps(args_obj),
+                                    },
+                                }
+                            )
+
                         if tool_calls:
                             finish_reason = "tool_calls"
-                            text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+                            text = re.sub(
+                                r"<\|plamo:begin_tool_requests:plamo\|>.*?<\|plamo:end_tool_requests:plamo\|>",
+                                "",
+                                text,
+                                flags=re.DOTALL,
+                            ).strip()
+
 
                 if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
                     tool_calls = [tool_calls[0]]
