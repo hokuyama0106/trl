@@ -38,7 +38,6 @@ dependencies = [
     "tensorboard>=2.20.0",
     "transformers==4.57.1",
     "vllm==0.13.0",
-    "vllm-plamo3",
 ]
 dynamic = ["version"]
 
@@ -199,6 +198,3 @@ filterwarnings = [
     "ignore:The argument 'device' of Tensor.pin_memory:DeprecationWarning",
     "ignore:The argument 'device' of Tensor.is_pinned:DeprecationWarning",
 ]
-
-[tool.uv.sources]
-vllm-plamo3 = { git = "file:///mnt/shared/hokuyama/vllm-plamo3-plugin", rev = "bc2490a7c698303b59a346d395a5064490adcdee" }
