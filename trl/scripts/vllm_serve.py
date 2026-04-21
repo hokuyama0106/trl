@@ -979,6 +979,11 @@ def main(script_args: ScriptArguments):
             "stop": request.stop,
         }
 
+        tokenizer = app.state.tokenizer
+        if sampling_kwargs["stop"] is None and tokenizer.eos_token:
+            sampling_kwargs["stop"] = tokenizer.eos_token
+            logger.info(f"EOS token {tokenizer.eos_token} is set.")
+
         if request.logprobs or request.top_logprobs:
             sampling_kwargs["logprobs"] = request.top_logprobs if request.top_logprobs else 1
 
