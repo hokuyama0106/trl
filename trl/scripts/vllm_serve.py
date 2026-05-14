@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import asyncio
 import base64
 import json
 import logging
@@ -532,15 +533,24 @@ def main(script_args: ScriptArguments):
                 if isinstance(msg, dict) and msg.get("status") == "ready":
                     ready_connections.add(connection)
 
-        yield
+        batch_worker_task = asyncio.create_task(chat_completion_batch_worker())
 
-        # Wait for processes to terminate
-        for process in processes:
-            process.join(timeout=10)  # Wait for 10 seconds for the process to terminate
-            if process.is_alive():
-                logger.warning(f"Process {process} is still alive after 10 seconds, attempting to terminate...")
-                process.terminate()
-                process.join()  # ensure process termination after calling terminate()
+        try:
+            yield
+        finally:
+            batch_worker_task.cancel()
+            try:
+                await batch_worker_task
+            except asyncio.CancelledError:
+                pass
+
+            # Wait for processes to terminate
+            for process in processes:
+                process.join(timeout=10)  # Wait for 10 seconds for the process to terminate
+                if process.is_alive():
+                    logger.warning(f"Process {process} is still alive after 10 seconds, attempting to terminate...")
+                    process.terminate()
+                    process.join()  # ensure process termination after calling terminate()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -955,8 +965,49 @@ def main(script_args: ScriptArguments):
         tool_choice: str | dict = "auto"
         parallel_tool_calls: bool = True
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: ChatCompletionRequest):
+    CHAT_COMPLETION_BATCH_SIZE = 256
+    CHAT_COMPLETION_BATCH_TIMEOUT_SEC = 0.01
+
+    @dataclass
+    class PendingChatCompletion:
+        request: ChatCompletionRequest
+        future: asyncio.Future
+
+    chat_completion_queue: asyncio.Queue[PendingChatCompletion] = asyncio.Queue()
+
+    async def chat_completion_batch_worker():
+        while True:
+            first = await chat_completion_queue.get()
+            batch = [first]
+
+            deadline = asyncio.get_running_loop().time() + CHAT_COMPLETION_BATCH_TIMEOUT_SEC
+
+            while len(batch) < CHAT_COMPLETION_BATCH_SIZE:
+                timeout = deadline - asyncio.get_running_loop().time()
+                if timeout <= 0:
+                    break
+
+                try:
+                    item = await asyncio.wait_for(chat_completion_queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    break
+
+                batch.append(item)
+
+            try:
+                responses = await process_chat_completion_batch([item.request for item in batch])
+                for item, response in zip(batch, responses, strict=True):
+                    if not item.future.done():
+                        item.future.set_result(response)
+            except Exception as exc:
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(exc)
+            finally:
+                for _ in batch:
+                    chat_completion_queue.task_done()
+
+    async def process_chat_completion_single(request: ChatCompletionRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created_at = int(time.time())
 
@@ -981,8 +1032,8 @@ def main(script_args: ScriptArguments):
 
         ## TODO: Specify stop token from client side.
         if sampling_kwargs["stop"] is None:
-            sampling_kwargs["stop"] = "<|plamo:tag|>" 
-            logger.info(f"Stop token <|plamo:tag|> is set.")
+            sampling_kwargs["stop"] = "<|plamo:tag|>"
+            logger.info("Stop token <|plamo:tag|> is set.")
 
         if request.logprobs or request.top_logprobs:
             sampling_kwargs["logprobs"] = request.top_logprobs if request.top_logprobs else 1
@@ -1170,7 +1221,6 @@ def main(script_args: ScriptArguments):
                                 flags=re.DOTALL,
                             ).strip()
 
-
                 if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
                     tool_calls = [tool_calls[0]]
 
@@ -1214,6 +1264,240 @@ def main(script_args: ScriptArguments):
                 "total_tokens": total_input_tokens + total_output_tokens,
             },
         }
+
+    def make_chat_completion_batch_key(request: ChatCompletionRequest):
+        max_tokens = request.max_completion_tokens or request.max_tokens or 512
+        stop = request.stop
+        if stop is None:
+            stop = "<|plamo:tag|>"
+
+        return (
+            request.n,
+            request.temperature,
+            request.top_p,
+            max_tokens,
+            request.presence_penalty,
+            request.frequency_penalty,
+            json.dumps(stop, sort_keys=True),
+            request.logprobs,
+            request.top_logprobs,
+            json.dumps(request.tools, sort_keys=True),
+            json.dumps(request.tool_choice, sort_keys=True)
+            if isinstance(request.tool_choice, dict)
+            else request.tool_choice,
+            request.parallel_tool_calls,
+        )
+
+    async def process_chat_completion_batch(requests: list[ChatCompletionRequest]):
+        responses = [None] * len(requests)
+
+        normal_items = []
+        for index, request in enumerate(requests):
+            has_prefix_token_ids = any(
+                msg.get("role") == "assistant" and "prompt_token_ids" in msg for msg in request.messages
+            )
+            if has_prefix_token_ids:
+                responses[index] = await process_chat_completion_single(request)
+            else:
+                normal_items.append((index, request))
+
+        grouped_items = {}
+        for index, request in normal_items:
+            key = make_chat_completion_batch_key(request)
+            grouped_items.setdefault(key, []).append((index, request))
+
+        for _, items in grouped_items.items():
+            batch_indices = [index for index, _ in items]
+            batch_requests = [request for _, request in items]
+
+            batch_responses = await process_chat_completion_normal_batch(batch_requests)
+
+            for index, response in zip(batch_indices, batch_responses, strict=True):
+                responses[index] = response
+
+        return responses
+
+    async def process_chat_completion_normal_batch(requests: list[ChatCompletionRequest]):
+        first_request = requests[0]
+
+        completion_ids = [f"chatcmpl-{uuid.uuid4().hex[:24]}" for _ in requests]
+        created_at = int(time.time())
+
+        batched_messages = []
+        for request in requests:
+            messages = []
+            for msg in request.messages:
+                role = msg.get("role", "")
+                if role not in ["system", "user", "assistant", "tool"]:
+                    logger.warning(f"Unknown message role: {role}")
+                messages.append(msg)
+            batched_messages.append(messages)
+
+        max_tokens = first_request.max_completion_tokens or first_request.max_tokens or 512
+
+        sampling_kwargs = {
+            "n": first_request.n,
+            "temperature": first_request.temperature,
+            "top_p": first_request.top_p,
+            "max_tokens": max_tokens,
+            "presence_penalty": first_request.presence_penalty,
+            "frequency_penalty": first_request.frequency_penalty,
+            "stop": first_request.stop,
+        }
+
+        if sampling_kwargs["stop"] is None:
+            sampling_kwargs["stop"] = "<|plamo:tag|>"
+            logger.info("Stop token <|plamo:tag|> is set.")
+
+        if first_request.logprobs or first_request.top_logprobs:
+            sampling_kwargs["logprobs"] = first_request.top_logprobs if first_request.top_logprobs else 1
+
+        sampling_params = SamplingParams(**sampling_kwargs)
+
+        chat_template_kwargs = {}
+        if first_request.tool_choice and first_request.tool_choice != "auto":
+            chat_template_kwargs["tool_choice"] = first_request.tool_choice
+
+        chunked_messages = chunk_list(batched_messages, script_args.data_parallel_size)
+
+        for connection, message_chunk in zip(connections, chunked_messages, strict=True):
+            if not message_chunk:
+                message_chunk = [[{"role": "user", "content": "<placeholder>"}]]
+
+            kwargs = {
+                "messages": message_chunk,
+                "sampling_params": sampling_params,
+                "tools": first_request.tools,
+                "chat_template_kwargs": chat_template_kwargs,
+            }
+            connection.send({"type": "call", "method": "chat", "kwargs": kwargs})
+
+        all_outputs = [connection.recv() for connection in connections]
+        all_outputs = [output for output, msg_chunk in zip(all_outputs, chunked_messages, strict=True) if msg_chunk]
+        all_outputs = list(chain.from_iterable(all_outputs))
+        if len(all_outputs) != len(requests):
+            logger.warning(
+                "Expected %d chat completion outputs, but got %d. Falling back to single request processing.",
+                len(requests),
+                len(all_outputs),
+            )
+            return [await process_chat_completion_single(request) for request in requests]
+
+        responses = []
+
+        for request, completion_id, output in zip(requests, completion_ids, all_outputs, strict=True):
+            choices = []
+            total_input_tokens = len(output.prompt_token_ids)
+            total_output_tokens = 0
+
+            for idx, gen_output in enumerate(output.outputs):
+                total_output_tokens += len(gen_output.token_ids)
+                text = gen_output.text if hasattr(gen_output, "text") else ""
+
+                tool_calls = None
+                finish_reason = gen_output.finish_reason if hasattr(gen_output, "finish_reason") else "stop"
+
+                if request.tools and text:
+                    tool_req_pattern = r"<\|plamo:begin_tool_request:plamo\|>(.*?)<\|plamo:end_tool_request:plamo\|>"
+                    tool_req_blocks = re.findall(tool_req_pattern, text, re.DOTALL)
+
+                    if tool_req_blocks:
+                        tool_calls = []
+
+                        for block in tool_req_blocks:
+                            name_pattern = r"<\|plamo:begin_tool_name:plamo\|>(.*?)<\|plamo:end_tool_name:plamo\|>"
+                            m_name = re.search(name_pattern, block, re.DOTALL)
+                            if not m_name:
+                                continue
+
+                            tool_name = m_name.group(1).strip()
+
+                            args_pattern = r"<\|plamo:msg\|>\s*(\{.*?\})\s*<"
+                            m_args = re.search(args_pattern, block, re.DOTALL)
+
+                            args_obj = {}
+                            if m_args:
+                                args_raw = m_args.group(1).strip()
+                                try:
+                                    args_obj = json.loads(args_raw)
+                                except json.JSONDecodeError:
+                                    continue
+
+                            tool_calls.append(
+                                {
+                                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": json.dumps(args_obj),
+                                    },
+                                }
+                            )
+
+                        if tool_calls:
+                            finish_reason = "tool_calls"
+                            text = re.sub(
+                                r"<\|plamo:begin_tool_requests:plamo\|>.*?<\|plamo:end_tool_requests:plamo\|>",
+                                "",
+                                text,
+                                flags=re.DOTALL,
+                            ).strip()
+
+                if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
+                    tool_calls = [tool_calls[0]]
+
+                logprobs_data = None
+                if request.logprobs and hasattr(gen_output, "logprobs") and gen_output.logprobs:
+                    logprobs_data = {
+                        "content": [
+                            {
+                                "token": str(token_id),
+                                "logprob": float(list(logprob_dict.values())[0].logprob) if logprob_dict else 0.0,
+                                "bytes": None,
+                                "top_logprobs": [],
+                            }
+                            for token_id, logprob_dict in zip(gen_output.token_ids, gen_output.logprobs, strict=False)
+                        ]
+                    }
+
+                choices.append(
+                    {
+                        "index": idx,
+                        "message": {
+                            "role": "assistant",
+                            "content": text if not tool_calls else None,
+                            "tool_calls": tool_calls,
+                        },
+                        "logprobs": logprobs_data,
+                        "finish_reason": finish_reason,
+                    }
+                )
+
+            responses.append(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created_at,
+                    "model": request.model or script_args.model,
+                    "choices": choices,
+                    "usage": {
+                        "prompt_tokens": total_input_tokens,
+                        "completion_tokens": total_output_tokens,
+                        "total_tokens": total_input_tokens + total_output_tokens,
+                    },
+                }
+            )
+
+        return responses
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: ChatCompletionRequest):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        await chat_completion_queue.put(PendingChatCompletion(request=request, future=future))
+
+        return await future
 
     class TokenizeRequest(BaseModel):
         model: str | None = None
