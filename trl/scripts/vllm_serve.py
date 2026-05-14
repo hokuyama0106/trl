@@ -966,7 +966,7 @@ def main(script_args: ScriptArguments):
         parallel_tool_calls: bool = True
 
     CHAT_COMPLETION_BATCH_SIZE = 256
-    CHAT_COMPLETION_BATCH_TIMEOUT_SEC = 0.01
+    CHAT_COMPLETION_BATCH_TIMEOUT_SEC = 1.
 
     @dataclass
     class PendingChatCompletion:
@@ -1318,6 +1318,7 @@ def main(script_args: ScriptArguments):
         return responses
 
     async def process_chat_completion_normal_batch(requests: list[ChatCompletionRequest]):
+        logger.info("Running normal chat completion batch: batch_size=%d", len(requests))
         first_request = requests[0]
 
         completion_ids = [f"chatcmpl-{uuid.uuid4().hex[:24]}" for _ in requests]
