@@ -965,7 +965,7 @@ def main(script_args: ScriptArguments):
         tool_choice: str | dict = "auto"
         parallel_tool_calls: bool = True
 
-    CHAT_COMPLETION_BATCH_SIZE = 256
+    CHAT_COMPLETION_BATCH_SIZE = 1024
     CHAT_COMPLETION_BATCH_TIMEOUT_SEC = 2.0
 
     @dataclass
@@ -1715,7 +1715,7 @@ def main(script_args: ScriptArguments):
         host=script_args.host,
         port=script_args.port,
         log_level=script_args.log_level,
-        limit_concurrency=256,
+        limit_concurrency=1024,
         backlog=4096,
         timeout_keep_alive=600,
     )
