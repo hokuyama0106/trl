@@ -367,6 +367,7 @@ def llm_worker(
         enable_prefix_caching=script_args.enable_prefix_caching,
         kv_cache_dtype=script_args.kv_cache_dtype,
         max_model_len=script_args.max_model_len,
+        max_num_seqs=1024,
         worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
         trust_remote_code=script_args.trust_remote_code,
         model_impl=script_args.vllm_model_impl,
@@ -966,7 +967,7 @@ def main(script_args: ScriptArguments):
         parallel_tool_calls: bool = True
 
     CHAT_COMPLETION_BATCH_SIZE = 1024
-    CHAT_COMPLETION_BATCH_TIMEOUT_SEC = 2.0
+    CHAT_COMPLETION_BATCH_TIMEOUT_SEC = 5.0
 
     @dataclass
     class PendingChatCompletion:
