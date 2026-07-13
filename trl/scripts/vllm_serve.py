@@ -489,6 +489,24 @@ def _replace_prefix_tokens(
     return result
 
 
+def _encode_think_tags(text: str) -> str:
+    """Convert textual think tags to PLaMo special think tokens for model input."""
+    return text.replace("<think>", "<|plamo:begin_think:plamo|>").replace("</think>", "<|plamo:end_think:plamo|>")
+
+
+def _decode_think_tags(text: str) -> str:
+    """Convert PLaMo special think tokens back to textual think tags for model output."""
+    return text.replace("<|plamo:begin_think:plamo|>", "<think>").replace("<|plamo:end_think:plamo|>", "</think>")
+
+
+def _encode_think_tags_in_messages(messages: list[dict]) -> list[dict]:
+    """Return a shallow-copied message list with string content think tags encoded for model input."""
+    return [
+        {**msg, "content": _encode_think_tags(msg["content"]) if isinstance(msg.get("content"), str) else msg.get("content")}
+        for msg in messages
+    ]
+
+
 def main(script_args: ScriptArguments):
     if not is_fastapi_available():
         raise ImportError(
@@ -654,6 +672,8 @@ def main(script_args: ScriptArguments):
 
         prompts = []
         for prompt, image in zip(request.prompts, request.images, strict=True):
+            # Convert think tags for input
+            prompt = _encode_think_tags(prompt)
             row = {"prompt": prompt}
             if image is not None:
                 row["multi_modal_data"] = {"image": Image.open(BytesIO(base64.b64decode(image)))}
@@ -793,10 +813,14 @@ def main(script_args: ScriptArguments):
         }
         ```
         """
-        # Convert PIL images to base64 strings
+        # Convert PIL images to base64 strings and convert think tags for input
         for message_list in request.messages:
             for message in message_list:
-                if isinstance(message["content"], list):
+                # Convert think tags for input (string content)
+                if isinstance(message.get("content"), str):
+                    message["content"] = _encode_think_tags(message["content"])
+                # Handle PIL images
+                if isinstance(message.get("content"), list):
                     for part in message["content"]:
                         if part["type"] == "image_pil":
                             part["image_pil"] = Image.open(BytesIO(base64.b64decode(part["image_pil"])))
@@ -1017,6 +1041,10 @@ def main(script_args: ScriptArguments):
             role = msg.get("role", "")
             if role not in ["system", "user", "assistant", "tool"]:
                 logger.warning(f"Unknown message role: {role}")
+            # Convert think tags for input
+            msg = dict(msg)  # shallow copy to avoid modifying original
+            if isinstance(msg.get("content"), str):
+                msg["content"] = _encode_think_tags(msg["content"])
             messages.append(msg)
 
         sampling_params = make_chat_completion_sampling_params(request)
@@ -1152,6 +1180,9 @@ def main(script_args: ScriptArguments):
             for gen_output in output.outputs:
                 total_output_tokens += len(gen_output.token_ids)
                 text = gen_output.text if hasattr(gen_output, "text") else ""
+
+                # Reverse the think tag replacement for output
+                text = _decode_think_tags(text)
 
                 tool_calls = None
                 finish_reason = gen_output.finish_reason if hasattr(gen_output, "finish_reason") else "stop"
@@ -1327,6 +1358,9 @@ def main(script_args: ScriptArguments):
         return SamplingParams(**sampling_kwargs)
 
     def parse_tool_calls_from_text(request: ChatCompletionRequest, text: str, finish_reason: str):
+        # Reverse the think tag replacement for output
+        text = _decode_think_tags(text)
+
         tool_calls = None
 
         if request.tools and text:
@@ -1458,6 +1492,10 @@ def main(script_args: ScriptArguments):
                 role = msg.get("role", "")
                 if role not in ["system", "user", "assistant", "tool"]:
                     logger.warning(f"Unknown message role: {role}")
+                # Convert think tags for input
+                msg = dict(msg)  # shallow copy to avoid modifying original
+                if isinstance(msg.get("content"), str):
+                    msg["content"] = _encode_think_tags(msg["content"])
                 messages.append(msg)
             batched_messages.append(messages)
 
@@ -1514,7 +1552,8 @@ def main(script_args: ScriptArguments):
         if first_request.tool_choice and first_request.tool_choice != "auto":
             chat_template_kwargs["tool_choice"] = first_request.tool_choice
 
-        batched_messages = [request.messages for request in requests]
+        # Convert think tags for input (keep parity with normal batch / single / tokenize paths)
+        batched_messages = [_encode_think_tags_in_messages(request.messages) for request in requests]
 
         connections[0].send(
             {
@@ -1647,6 +1686,9 @@ def main(script_args: ScriptArguments):
     @app.post("/tokenize")
     async def tokenize(request: TokenizeRequest):
         messages = request.messages
+
+        # Convert think tags for input
+        messages = _encode_think_tags_in_messages(messages)
 
         has_prefix_token_ids = any(msg.get("role") == "assistant" and "prompt_token_ids" in msg for msg in messages)
 
