@@ -494,17 +494,25 @@ def _encode_think_tags(text: str) -> str:
     return text.replace("<think>", "<|plamo:begin_think:plamo|>").replace("</think>", "<|plamo:end_think:plamo|>")
 
 
-def _decode_think_tags(text: str) -> str:
-    """Convert PLaMo special think tokens back to textual think tags for model output."""
-    return text.replace("<|plamo:begin_think:plamo|>", "<think>").replace("<|plamo:end_think:plamo|>", "</think>")
+def _split_reasoning_from_text(text: str) -> tuple[str | None, str]:
+    """Split PLaMo special think-token spans out of generated text.
 
-
-def _encode_think_tags_in_messages(messages: list[dict]) -> list[dict]:
-    """Return a shallow-copied message list with string content think tags encoded for model input."""
-    return [
-        {**msg, "content": _encode_think_tags(msg["content"]) if isinstance(msg.get("content"), str) else msg.get("content")}
-        for msg in messages
-    ]
+    Returns ``(reasoning_content, remaining_text)``. ``reasoning_content`` is ``None`` when the text
+    has no think span. Used to populate the ``reasoning_content`` field expected by NeMo Gym's
+    ``uses_reasoning_parser`` mode instead of embedding think tags in ``content``.
+    """
+    begin, end = "<|plamo:begin_think:plamo|>", "<|plamo:end_think:plamo|>"
+    span_pattern = re.escape(begin) + r"(.*?)" + re.escape(end)
+    reasoning_parts = re.findall(span_pattern, text, re.DOTALL)
+    remaining = re.sub(span_pattern, "", text, flags=re.DOTALL)
+    # Handle a think span left open by truncation (e.g. hit max_tokens mid-reasoning).
+    if begin in remaining:
+        head, _, tail = remaining.partition(begin)
+        reasoning_parts.append(tail)
+        remaining = head
+    if not reasoning_parts:
+        return None, remaining
+    return "".join(reasoning_parts), remaining
 
 
 def main(script_args: ScriptArguments):
@@ -1036,15 +1044,13 @@ def main(script_args: ScriptArguments):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created_at = int(time.time())
 
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
         messages = []
         for msg in request.messages:
             role = msg.get("role", "")
             if role not in ["system", "user", "assistant", "tool"]:
                 logger.warning(f"Unknown message role: {role}")
-            # Convert think tags for input
-            msg = dict(msg)  # shallow copy to avoid modifying original
-            if isinstance(msg.get("content"), str):
-                msg["content"] = _encode_think_tags(msg["content"])
             messages.append(msg)
 
         sampling_params = make_chat_completion_sampling_params(request)
@@ -1181,60 +1187,11 @@ def main(script_args: ScriptArguments):
                 total_output_tokens += len(gen_output.token_ids)
                 text = gen_output.text if hasattr(gen_output, "text") else ""
 
-                # Reverse the think tag replacement for output
-                text = _decode_think_tags(text)
-
-                tool_calls = None
                 finish_reason = gen_output.finish_reason if hasattr(gen_output, "finish_reason") else "stop"
 
-                # Manual XML-json tool call parsing
-                if request.tools and text:
-                    tool_req_pattern = r"<\|plamo:begin_tool_request:plamo\|>(.*?)<\|plamo:end_tool_request:plamo\|>"
-                    tool_req_blocks = re.findall(tool_req_pattern, text, re.DOTALL)
-
-                    if tool_req_blocks:
-                        tool_calls = []
-
-                        for block in tool_req_blocks:
-                            name_pattern = r"<\|plamo:begin_tool_name:plamo\|>(.*?)<\|plamo:end_tool_name:plamo\|>"
-                            m_name = re.search(name_pattern, block, re.DOTALL)
-                            if not m_name:
-                                continue
-                            tool_name = m_name.group(1).strip()
-
-                            args_pattern = r"<\|plamo:msg\|>\s*(\{.*?\})\s*<"
-                            m_args = re.search(args_pattern, block, re.DOTALL)
-
-                            args_obj = {}
-                            if m_args:
-                                args_raw = m_args.group(1).strip()
-                                try:
-                                    args_obj = json.loads(args_raw)
-                                except json.JSONDecodeError:
-                                    continue
-
-                            tool_calls.append(
-                                {
-                                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_name,
-                                        "arguments": json.dumps(args_obj),
-                                    },
-                                }
-                            )
-
-                        if tool_calls:
-                            finish_reason = "tool_calls"
-                            text = re.sub(
-                                r"<\|plamo:begin_tool_requests:plamo\|>.*?<\|plamo:end_tool_requests:plamo\|>",
-                                "",
-                                text,
-                                flags=re.DOTALL,
-                            ).strip()
-
-                if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
-                    tool_calls = [tool_calls[0]]
+                text, tool_calls, finish_reason, reasoning_content = parse_tool_calls_from_text(
+                    request, text, finish_reason
+                )
 
                 logprobs_data = None
                 if request.logprobs and hasattr(gen_output, "logprobs") and gen_output.logprobs:
@@ -1250,14 +1207,19 @@ def main(script_args: ScriptArguments):
                         ]
                     }
 
+                message = {
+                    "role": "assistant",
+                    "content": text if not tool_calls else None,
+                    "tool_calls": tool_calls,
+                }
+                if reasoning_content:
+                    message["reasoning_content"] = reasoning_content
+                    message["reasoning"] = reasoning_content
+
                 choices.append(
                     {
                         "index": idx,
-                        "message": {
-                            "role": "assistant",
-                            "content": text if not tool_calls else None,
-                            "tool_calls": tool_calls,
-                        },
+                        "message": message,
                         "logprobs": logprobs_data,
                         "finish_reason": finish_reason,
                     }
@@ -1358,8 +1320,8 @@ def main(script_args: ScriptArguments):
         return SamplingParams(**sampling_kwargs)
 
     def parse_tool_calls_from_text(request: ChatCompletionRequest, text: str, finish_reason: str):
-        # Reverse the think tag replacement for output
-        text = _decode_think_tags(text)
+        # Extract reasoning into a separate field (reasoning_content contract) instead of think tags
+        reasoning_content, text = _split_reasoning_from_text(text)
 
         tool_calls = None
 
@@ -1412,7 +1374,7 @@ def main(script_args: ScriptArguments):
         if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
             tool_calls = [tool_calls[0]]
 
-        return text, tool_calls, finish_reason
+        return text, tool_calls, finish_reason, reasoning_content
 
     def build_chat_completion_responses(
         requests: list[ChatCompletionRequest],
@@ -1432,7 +1394,9 @@ def main(script_args: ScriptArguments):
                 text = gen_output.text if hasattr(gen_output, "text") else ""
                 finish_reason = gen_output.finish_reason if hasattr(gen_output, "finish_reason") else "stop"
 
-                text, tool_calls, finish_reason = parse_tool_calls_from_text(request, text, finish_reason)
+                text, tool_calls, finish_reason, reasoning_content = parse_tool_calls_from_text(
+                    request, text, finish_reason
+                )
 
                 logprobs_data = None
                 if request.logprobs and hasattr(gen_output, "logprobs") and gen_output.logprobs:
@@ -1448,14 +1412,19 @@ def main(script_args: ScriptArguments):
                         ]
                     }
 
+                message = {
+                    "role": "assistant",
+                    "content": text if not tool_calls else None,
+                    "tool_calls": tool_calls,
+                }
+                if reasoning_content:
+                    message["reasoning_content"] = reasoning_content
+                    message["reasoning"] = reasoning_content
+
                 choices.append(
                     {
                         "index": idx,
-                        "message": {
-                            "role": "assistant",
-                            "content": text if not tool_calls else None,
-                            "tool_calls": tool_calls,
-                        },
+                        "message": message,
                         "logprobs": logprobs_data,
                         "finish_reason": finish_reason,
                     }
@@ -1485,19 +1454,15 @@ def main(script_args: ScriptArguments):
         completion_ids = [f"chatcmpl-{uuid.uuid4().hex[:24]}" for _ in requests]
         created_at = int(time.time())
 
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
         batched_messages = []
         for request in requests:
-            messages = []
             for msg in request.messages:
                 role = msg.get("role", "")
                 if role not in ["system", "user", "assistant", "tool"]:
                     logger.warning(f"Unknown message role: {role}")
-                # Convert think tags for input
-                msg = dict(msg)  # shallow copy to avoid modifying original
-                if isinstance(msg.get("content"), str):
-                    msg["content"] = _encode_think_tags(msg["content"])
-                messages.append(msg)
-            batched_messages.append(messages)
+            batched_messages.append(request.messages)
 
         sampling_params = make_chat_completion_sampling_params(first_request)
 
@@ -1552,8 +1517,9 @@ def main(script_args: ScriptArguments):
         if first_request.tool_choice and first_request.tool_choice != "auto":
             chat_template_kwargs["tool_choice"] = first_request.tool_choice
 
-        # Convert think tags for input (keep parity with normal batch / single / tokenize paths)
-        batched_messages = [_encode_think_tags_in_messages(request.messages) for request in requests]
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
+        batched_messages = [request.messages for request in requests]
 
         connections[0].send(
             {
@@ -1687,9 +1653,8 @@ def main(script_args: ScriptArguments):
     async def tokenize(request: TokenizeRequest):
         messages = request.messages
 
-        # Convert think tags for input
-        messages = _encode_think_tags_in_messages(messages)
-
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
         has_prefix_token_ids = any(msg.get("role") == "assistant" and "prompt_token_ids" in msg for msg in messages)
 
         kwargs = {
