@@ -390,9 +390,11 @@ def llm_worker(
         if command["type"] in ["call", "fire_and_forget"]:
             method_name = command["method"]
             args, kwargs = command.get("args", ()), command.get("kwargs", {})
-            method = getattr(llm, method_name)
 
             try:
+                # getattr is inside the try so that a method removed/renamed by a vLLM upgrade surfaces as a
+                # logged AttributeError rather than an unhandled crash that leaves the parent's recv() hanging.
+                method = getattr(llm, method_name)
                 result = method(*args, **kwargs)
             except ValueError as e:
                 error_msg = str(e)
@@ -404,8 +406,8 @@ def llm_worker(
                         raise
                 else:
                     raise
-            except Exception as e:
-                logger.error(f"[Worker] Unexpected error in {method_name}: {e}")
+            except Exception:
+                logger.exception(f"[Worker] Unexpected error in {method_name}")
                 raise
 
             if command["type"] == "call":
@@ -489,6 +491,32 @@ def _replace_prefix_tokens(
     return result
 
 
+def _encode_think_tags(text: str) -> str:
+    """Convert textual think tags to PLaMo special think tokens for model input."""
+    return text.replace("<think>", "<|plamo:begin_think:plamo|>").replace("</think>", "<|plamo:end_think:plamo|>")
+
+
+def _split_reasoning_from_text(text: str) -> tuple[str | None, str]:
+    """Split PLaMo special think-token spans out of generated text.
+
+    Returns ``(reasoning_content, remaining_text)``. ``reasoning_content`` is ``None`` when the text
+    has no think span. Used to populate the ``reasoning_content`` field expected by NeMo Gym's
+    ``uses_reasoning_parser`` mode instead of embedding think tags in ``content``.
+    """
+    begin, end = "<|plamo:begin_think:plamo|>", "<|plamo:end_think:plamo|>"
+    span_pattern = re.escape(begin) + r"(.*?)" + re.escape(end)
+    reasoning_parts = re.findall(span_pattern, text, re.DOTALL)
+    remaining = re.sub(span_pattern, "", text, flags=re.DOTALL)
+    # Handle a think span left open by truncation (e.g. hit max_tokens mid-reasoning).
+    if begin in remaining:
+        head, _, tail = remaining.partition(begin)
+        reasoning_parts.append(tail)
+        remaining = head
+    if not reasoning_parts:
+        return None, remaining
+    return "".join(reasoning_parts), remaining
+
+
 def main(script_args: ScriptArguments):
     if not is_fastapi_available():
         raise ImportError(
@@ -554,6 +582,39 @@ def main(script_args: ScriptArguments):
                     process.join()  # ensure process termination after calling terminate()
 
     app = FastAPI(lifespan=lifespan)
+
+    def preprocess_chat_local(
+        messages_batch: list[list[dict]],
+        tools: list[dict] | None,
+        add_generation_prompt: bool,
+        chat_template_kwargs: dict | None = None,
+    ) -> list[dict]:
+        """Tokenize chat conversations locally, inside the server process.
+
+        Re-implements vLLM's ``LLM.preprocess_chat`` (present in vLLM 0.13, removed in later releases such
+        as 0.23) using the HF tokenizer's chat template. It mirrors vLLM's HF path exactly: render the
+        conversation to text via the chat template, then encode without adding special tokens (the template
+        already includes them). Running it here avoids a round-trip to the worker process and the dependency
+        on a vLLM API whose availability changes across versions. Text-only: multimodal inputs are not
+        handled (none of the callers pass images).
+
+        Returns a list of ``{"prompt_token_ids": [...]}`` dicts, one per input conversation, matching the
+        subset of the old ``preprocess_chat`` return value that the callers use.
+        """
+        tokenizer = app.state.tokenizer
+        template_kwargs = dict(chat_template_kwargs or {})
+        prompts = []
+        for messages in messages_batch:
+            prompt_str = tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=False,
+                **template_kwargs,
+            )
+            prompt_token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
+            prompts.append({"prompt_token_ids": prompt_token_ids})
+        return prompts
 
     # Define the endpoints for the model server
     @app.get("/health/")
@@ -654,6 +715,8 @@ def main(script_args: ScriptArguments):
 
         prompts = []
         for prompt, image in zip(request.prompts, request.images, strict=True):
+            # Convert think tags for input
+            prompt = _encode_think_tags(prompt)
             row = {"prompt": prompt}
             if image is not None:
                 row["multi_modal_data"] = {"image": Image.open(BytesIO(base64.b64decode(image)))}
@@ -793,10 +856,14 @@ def main(script_args: ScriptArguments):
         }
         ```
         """
-        # Convert PIL images to base64 strings
+        # Convert PIL images to base64 strings and convert think tags for input
         for message_list in request.messages:
             for message in message_list:
-                if isinstance(message["content"], list):
+                # Convert think tags for input (string content)
+                if isinstance(message.get("content"), str):
+                    message["content"] = _encode_think_tags(message["content"])
+                # Handle PIL images
+                if isinstance(message.get("content"), list):
                     for part in message["content"]:
                         if part["type"] == "image_pil":
                             part["image_pil"] = Image.open(BytesIO(base64.b64decode(part["image_pil"])))
@@ -1012,6 +1079,8 @@ def main(script_args: ScriptArguments):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created_at = int(time.time())
 
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
         messages = []
         for msg in request.messages:
             role = msg.get("role", "")
@@ -1034,19 +1103,12 @@ def main(script_args: ScriptArguments):
             tokenizer = app.state.tokenizer
 
             # preprocess full conversation
-            connections[0].send(
-                {
-                    "type": "call",
-                    "method": "preprocess_chat",
-                    "kwargs": {
-                        "messages": [messages],
-                        "chat_template_kwargs": chat_template_kwargs,
-                        "tools": request.tools,
-                        "add_generation_prompt": True,
-                    },
-                }
+            template_prompts = preprocess_chat_local(
+                messages_batch=[messages],
+                tools=request.tools,
+                add_generation_prompt=True,
+                chat_template_kwargs=chat_template_kwargs,
             )
-            template_prompts = connections[0].recv()
             template_prompt = template_prompts[0]
 
             # extract model prefix tokens from last assistant message
@@ -1063,19 +1125,12 @@ def main(script_args: ScriptArguments):
 
             if model_prefix_tokens and last_assistant_idx is not None:
                 messages_to_last_assistant = messages[: last_assistant_idx + 1]
-                connections[0].send(
-                    {
-                        "type": "call",
-                        "method": "preprocess_chat",
-                        "kwargs": {
-                            "messages": [messages_to_last_assistant],
-                            "chat_template_kwargs": chat_template_kwargs,
-                            "tools": request.tools,
-                            "add_generation_prompt": False,
-                        },
-                    }
+                template_prefix_prompts = preprocess_chat_local(
+                    messages_batch=[messages_to_last_assistant],
+                    tools=request.tools,
+                    add_generation_prompt=False,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
-                template_prefix_prompts = connections[0].recv()
                 template_prefix_token_ids = template_prefix_prompts[0]["prompt_token_ids"]
 
                 corrected_token_ids = _replace_prefix_tokens(
@@ -1153,57 +1208,11 @@ def main(script_args: ScriptArguments):
                 total_output_tokens += len(gen_output.token_ids)
                 text = gen_output.text if hasattr(gen_output, "text") else ""
 
-                tool_calls = None
                 finish_reason = gen_output.finish_reason if hasattr(gen_output, "finish_reason") else "stop"
 
-                # Manual XML-json tool call parsing
-                if request.tools and text:
-                    tool_req_pattern = r"<\|plamo:begin_tool_request:plamo\|>(.*?)<\|plamo:end_tool_request:plamo\|>"
-                    tool_req_blocks = re.findall(tool_req_pattern, text, re.DOTALL)
-
-                    if tool_req_blocks:
-                        tool_calls = []
-
-                        for block in tool_req_blocks:
-                            name_pattern = r"<\|plamo:begin_tool_name:plamo\|>(.*?)<\|plamo:end_tool_name:plamo\|>"
-                            m_name = re.search(name_pattern, block, re.DOTALL)
-                            if not m_name:
-                                continue
-                            tool_name = m_name.group(1).strip()
-
-                            args_pattern = r"<\|plamo:msg\|>\s*(\{.*?\})\s*<"
-                            m_args = re.search(args_pattern, block, re.DOTALL)
-
-                            args_obj = {}
-                            if m_args:
-                                args_raw = m_args.group(1).strip()
-                                try:
-                                    args_obj = json.loads(args_raw)
-                                except json.JSONDecodeError:
-                                    continue
-
-                            tool_calls.append(
-                                {
-                                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_name,
-                                        "arguments": json.dumps(args_obj),
-                                    },
-                                }
-                            )
-
-                        if tool_calls:
-                            finish_reason = "tool_calls"
-                            text = re.sub(
-                                r"<\|plamo:begin_tool_requests:plamo\|>.*?<\|plamo:end_tool_requests:plamo\|>",
-                                "",
-                                text,
-                                flags=re.DOTALL,
-                            ).strip()
-
-                if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
-                    tool_calls = [tool_calls[0]]
+                text, tool_calls, finish_reason, reasoning_content = parse_tool_calls_from_text(
+                    request, text, finish_reason
+                )
 
                 logprobs_data = None
                 if request.logprobs and hasattr(gen_output, "logprobs") and gen_output.logprobs:
@@ -1219,14 +1228,19 @@ def main(script_args: ScriptArguments):
                         ]
                     }
 
+                message = {
+                    "role": "assistant",
+                    "content": text if not tool_calls else None,
+                    "tool_calls": tool_calls,
+                }
+                if reasoning_content:
+                    message["reasoning_content"] = reasoning_content
+                    message["reasoning"] = reasoning_content
+
                 choices.append(
                     {
                         "index": idx,
-                        "message": {
-                            "role": "assistant",
-                            "content": text if not tool_calls else None,
-                            "tool_calls": tool_calls,
-                        },
+                        "message": message,
                         "logprobs": logprobs_data,
                         "finish_reason": finish_reason,
                     }
@@ -1327,6 +1341,9 @@ def main(script_args: ScriptArguments):
         return SamplingParams(**sampling_kwargs)
 
     def parse_tool_calls_from_text(request: ChatCompletionRequest, text: str, finish_reason: str):
+        # Extract reasoning into a separate field (reasoning_content contract) instead of think tags
+        reasoning_content, text = _split_reasoning_from_text(text)
+
         tool_calls = None
 
         if request.tools and text:
@@ -1378,7 +1395,7 @@ def main(script_args: ScriptArguments):
         if not request.parallel_tool_calls and tool_calls and len(tool_calls) > 1:
             tool_calls = [tool_calls[0]]
 
-        return text, tool_calls, finish_reason
+        return text, tool_calls, finish_reason, reasoning_content
 
     def build_chat_completion_responses(
         requests: list[ChatCompletionRequest],
@@ -1398,7 +1415,9 @@ def main(script_args: ScriptArguments):
                 text = gen_output.text if hasattr(gen_output, "text") else ""
                 finish_reason = gen_output.finish_reason if hasattr(gen_output, "finish_reason") else "stop"
 
-                text, tool_calls, finish_reason = parse_tool_calls_from_text(request, text, finish_reason)
+                text, tool_calls, finish_reason, reasoning_content = parse_tool_calls_from_text(
+                    request, text, finish_reason
+                )
 
                 logprobs_data = None
                 if request.logprobs and hasattr(gen_output, "logprobs") and gen_output.logprobs:
@@ -1414,14 +1433,19 @@ def main(script_args: ScriptArguments):
                         ]
                     }
 
+                message = {
+                    "role": "assistant",
+                    "content": text if not tool_calls else None,
+                    "tool_calls": tool_calls,
+                }
+                if reasoning_content:
+                    message["reasoning_content"] = reasoning_content
+                    message["reasoning"] = reasoning_content
+
                 choices.append(
                     {
                         "index": idx,
-                        "message": {
-                            "role": "assistant",
-                            "content": text if not tool_calls else None,
-                            "tool_calls": tool_calls,
-                        },
+                        "message": message,
                         "logprobs": logprobs_data,
                         "finish_reason": finish_reason,
                     }
@@ -1451,15 +1475,15 @@ def main(script_args: ScriptArguments):
         completion_ids = [f"chatcmpl-{uuid.uuid4().hex[:24]}" for _ in requests]
         created_at = int(time.time())
 
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
         batched_messages = []
         for request in requests:
-            messages = []
             for msg in request.messages:
                 role = msg.get("role", "")
                 if role not in ["system", "user", "assistant", "tool"]:
                     logger.warning(f"Unknown message role: {role}")
-                messages.append(msg)
-            batched_messages.append(messages)
+            batched_messages.append(request.messages)
 
         sampling_params = make_chat_completion_sampling_params(first_request)
 
@@ -1514,21 +1538,16 @@ def main(script_args: ScriptArguments):
         if first_request.tool_choice and first_request.tool_choice != "auto":
             chat_template_kwargs["tool_choice"] = first_request.tool_choice
 
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
         batched_messages = [request.messages for request in requests]
 
-        connections[0].send(
-            {
-                "type": "call",
-                "method": "preprocess_chat",
-                "kwargs": {
-                    "messages": batched_messages,
-                    "chat_template_kwargs": chat_template_kwargs,
-                    "tools": first_request.tools,
-                    "add_generation_prompt": True,
-                },
-            }
+        template_prompts = preprocess_chat_local(
+            messages_batch=batched_messages,
+            tools=first_request.tools,
+            add_generation_prompt=True,
+            chat_template_kwargs=chat_template_kwargs,
         )
-        template_prompts = connections[0].recv()
 
         prefix_messages_batch = []
         model_prefix_tokens_batch = []
@@ -1557,19 +1576,12 @@ def main(script_args: ScriptArguments):
             else:
                 prefix_messages_batch.append(messages)
 
-        connections[0].send(
-            {
-                "type": "call",
-                "method": "preprocess_chat",
-                "kwargs": {
-                    "messages": prefix_messages_batch,
-                    "chat_template_kwargs": chat_template_kwargs,
-                    "tools": first_request.tools,
-                    "add_generation_prompt": False,
-                },
-            }
+        template_prefix_prompts = preprocess_chat_local(
+            messages_batch=prefix_messages_batch,
+            tools=first_request.tools,
+            add_generation_prompt=False,
+            chat_template_kwargs=chat_template_kwargs,
         )
-        template_prefix_prompts = connections[0].recv()
 
         corrected_prompts = []
 
@@ -1648,17 +1660,16 @@ def main(script_args: ScriptArguments):
     async def tokenize(request: TokenizeRequest):
         messages = request.messages
 
+        # Reasoning arrives in the reasoning_content field (handled by the chat template), so think tags
+        # are not re-encoded into content here.
         has_prefix_token_ids = any(msg.get("role") == "assistant" and "prompt_token_ids" in msg for msg in messages)
 
-        kwargs = {
-            "messages": [messages],
-            "tools": request.tools,
-            "add_generation_prompt": True,
-            "chat_template_kwargs": {},
-        }
-
-        connections[0].send({"type": "call", "method": "preprocess_chat", "kwargs": kwargs})
-        preprocessed_prompts = connections[0].recv()
+        preprocessed_prompts = preprocess_chat_local(
+            messages_batch=[messages],
+            tools=request.tools,
+            add_generation_prompt=True,
+            chat_template_kwargs={},
+        )
 
         if preprocessed_prompts and len(preprocessed_prompts) > 1:
             logger.warning(
@@ -1689,19 +1700,12 @@ def main(script_args: ScriptArguments):
             if model_prefix_tokens and last_assistant_idx is not None:
                 # Preprocess up to last assistant
                 messages_to_last_assistant = messages[: last_assistant_idx + 1]
-                connections[0].send(
-                    {
-                        "type": "call",
-                        "method": "preprocess_chat",
-                        "kwargs": {
-                            "messages": [messages_to_last_assistant],
-                            "tools": request.tools,
-                            "add_generation_prompt": False,
-                            "chat_template_kwargs": {},
-                        },
-                    }
+                template_prefix_prompts = preprocess_chat_local(
+                    messages_batch=[messages_to_last_assistant],
+                    tools=request.tools,
+                    add_generation_prompt=False,
+                    chat_template_kwargs={},
                 )
-                template_prefix_prompts = connections[0].recv()
                 template_prefix_token_ids = template_prefix_prompts[0]["prompt_token_ids"]
 
                 result_tokens = _replace_prefix_tokens(
