@@ -390,9 +390,11 @@ def llm_worker(
         if command["type"] in ["call", "fire_and_forget"]:
             method_name = command["method"]
             args, kwargs = command.get("args", ()), command.get("kwargs", {})
-            method = getattr(llm, method_name)
 
             try:
+                # getattr is inside the try so that a method removed/renamed by a vLLM upgrade surfaces as a
+                # logged AttributeError rather than an unhandled crash that leaves the parent's recv() hanging.
+                method = getattr(llm, method_name)
                 result = method(*args, **kwargs)
             except ValueError as e:
                 error_msg = str(e)
@@ -404,8 +406,8 @@ def llm_worker(
                         raise
                 else:
                     raise
-            except Exception as e:
-                logger.error(f"[Worker] Unexpected error in {method_name}: {e}")
+            except Exception:
+                logger.exception(f"[Worker] Unexpected error in {method_name}")
                 raise
 
             if command["type"] == "call":
@@ -580,6 +582,39 @@ def main(script_args: ScriptArguments):
                     process.join()  # ensure process termination after calling terminate()
 
     app = FastAPI(lifespan=lifespan)
+
+    def preprocess_chat_local(
+        messages_batch: list[list[dict]],
+        tools: list[dict] | None,
+        add_generation_prompt: bool,
+        chat_template_kwargs: dict | None = None,
+    ) -> list[dict]:
+        """Tokenize chat conversations locally, inside the server process.
+
+        Re-implements vLLM's ``LLM.preprocess_chat`` (present in vLLM 0.13, removed in later releases such
+        as 0.23) using the HF tokenizer's chat template. It mirrors vLLM's HF path exactly: render the
+        conversation to text via the chat template, then encode without adding special tokens (the template
+        already includes them). Running it here avoids a round-trip to the worker process and the dependency
+        on a vLLM API whose availability changes across versions. Text-only: multimodal inputs are not
+        handled (none of the callers pass images).
+
+        Returns a list of ``{"prompt_token_ids": [...]}`` dicts, one per input conversation, matching the
+        subset of the old ``preprocess_chat`` return value that the callers use.
+        """
+        tokenizer = app.state.tokenizer
+        template_kwargs = dict(chat_template_kwargs or {})
+        prompts = []
+        for messages in messages_batch:
+            prompt_str = tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=False,
+                **template_kwargs,
+            )
+            prompt_token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
+            prompts.append({"prompt_token_ids": prompt_token_ids})
+        return prompts
 
     # Define the endpoints for the model server
     @app.get("/health/")
@@ -1068,19 +1103,12 @@ def main(script_args: ScriptArguments):
             tokenizer = app.state.tokenizer
 
             # preprocess full conversation
-            connections[0].send(
-                {
-                    "type": "call",
-                    "method": "preprocess_chat",
-                    "kwargs": {
-                        "messages": [messages],
-                        "chat_template_kwargs": chat_template_kwargs,
-                        "tools": request.tools,
-                        "add_generation_prompt": True,
-                    },
-                }
+            template_prompts = preprocess_chat_local(
+                messages_batch=[messages],
+                tools=request.tools,
+                add_generation_prompt=True,
+                chat_template_kwargs=chat_template_kwargs,
             )
-            template_prompts = connections[0].recv()
             template_prompt = template_prompts[0]
 
             # extract model prefix tokens from last assistant message
@@ -1097,19 +1125,12 @@ def main(script_args: ScriptArguments):
 
             if model_prefix_tokens and last_assistant_idx is not None:
                 messages_to_last_assistant = messages[: last_assistant_idx + 1]
-                connections[0].send(
-                    {
-                        "type": "call",
-                        "method": "preprocess_chat",
-                        "kwargs": {
-                            "messages": [messages_to_last_assistant],
-                            "chat_template_kwargs": chat_template_kwargs,
-                            "tools": request.tools,
-                            "add_generation_prompt": False,
-                        },
-                    }
+                template_prefix_prompts = preprocess_chat_local(
+                    messages_batch=[messages_to_last_assistant],
+                    tools=request.tools,
+                    add_generation_prompt=False,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
-                template_prefix_prompts = connections[0].recv()
                 template_prefix_token_ids = template_prefix_prompts[0]["prompt_token_ids"]
 
                 corrected_token_ids = _replace_prefix_tokens(
@@ -1521,19 +1542,12 @@ def main(script_args: ScriptArguments):
         # are not re-encoded into content here.
         batched_messages = [request.messages for request in requests]
 
-        connections[0].send(
-            {
-                "type": "call",
-                "method": "preprocess_chat",
-                "kwargs": {
-                    "messages": batched_messages,
-                    "chat_template_kwargs": chat_template_kwargs,
-                    "tools": first_request.tools,
-                    "add_generation_prompt": True,
-                },
-            }
+        template_prompts = preprocess_chat_local(
+            messages_batch=batched_messages,
+            tools=first_request.tools,
+            add_generation_prompt=True,
+            chat_template_kwargs=chat_template_kwargs,
         )
-        template_prompts = connections[0].recv()
 
         prefix_messages_batch = []
         model_prefix_tokens_batch = []
@@ -1562,19 +1576,12 @@ def main(script_args: ScriptArguments):
             else:
                 prefix_messages_batch.append(messages)
 
-        connections[0].send(
-            {
-                "type": "call",
-                "method": "preprocess_chat",
-                "kwargs": {
-                    "messages": prefix_messages_batch,
-                    "chat_template_kwargs": chat_template_kwargs,
-                    "tools": first_request.tools,
-                    "add_generation_prompt": False,
-                },
-            }
+        template_prefix_prompts = preprocess_chat_local(
+            messages_batch=prefix_messages_batch,
+            tools=first_request.tools,
+            add_generation_prompt=False,
+            chat_template_kwargs=chat_template_kwargs,
         )
-        template_prefix_prompts = connections[0].recv()
 
         corrected_prompts = []
 
@@ -1657,15 +1664,12 @@ def main(script_args: ScriptArguments):
         # are not re-encoded into content here.
         has_prefix_token_ids = any(msg.get("role") == "assistant" and "prompt_token_ids" in msg for msg in messages)
 
-        kwargs = {
-            "messages": [messages],
-            "tools": request.tools,
-            "add_generation_prompt": True,
-            "chat_template_kwargs": {},
-        }
-
-        connections[0].send({"type": "call", "method": "preprocess_chat", "kwargs": kwargs})
-        preprocessed_prompts = connections[0].recv()
+        preprocessed_prompts = preprocess_chat_local(
+            messages_batch=[messages],
+            tools=request.tools,
+            add_generation_prompt=True,
+            chat_template_kwargs={},
+        )
 
         if preprocessed_prompts and len(preprocessed_prompts) > 1:
             logger.warning(
@@ -1696,19 +1700,12 @@ def main(script_args: ScriptArguments):
             if model_prefix_tokens and last_assistant_idx is not None:
                 # Preprocess up to last assistant
                 messages_to_last_assistant = messages[: last_assistant_idx + 1]
-                connections[0].send(
-                    {
-                        "type": "call",
-                        "method": "preprocess_chat",
-                        "kwargs": {
-                            "messages": [messages_to_last_assistant],
-                            "tools": request.tools,
-                            "add_generation_prompt": False,
-                            "chat_template_kwargs": {},
-                        },
-                    }
+                template_prefix_prompts = preprocess_chat_local(
+                    messages_batch=[messages_to_last_assistant],
+                    tools=request.tools,
+                    add_generation_prompt=False,
+                    chat_template_kwargs={},
                 )
-                template_prefix_prompts = connections[0].recv()
                 template_prefix_token_ids = template_prefix_prompts[0]["prompt_token_ids"]
 
                 result_tokens = _replace_prefix_tokens(
